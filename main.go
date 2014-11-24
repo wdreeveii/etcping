@@ -145,7 +145,7 @@ func main() {
 	var data_dump = make(chan dataEntry, 100)
 	p := fastping.NewPinger()
 	p.Debug = false
-	p.MaxRTT = time.Second * 10
+	p.MaxRTT = time.Second * 60
 	p.OnRecv = func(addr *net.IPAddr, t time.Duration) {
 		record := dataEntry{time.Now(), addr.String(), t}
 		fmt.Println("record:", record)
@@ -154,13 +154,13 @@ func main() {
 	p.OnIdle = func() {
 		fmt.Println("idle")
 	}
-	p.RunLoop()
+
 	/*<-p.Done()
 	if err := p.Err(); err != nil {
 		fmt.Println(err)
 		return
 	}*/
-
+	var started bool = false
 	var data_storage []dataEntry
 	var batch_insert_ticker = time.Tick(5 * time.Second)
 
@@ -171,7 +171,7 @@ func main() {
 
 	for {
 
-		restart := time.After(1 * time.Minute)
+		restart := time.After(10 * time.Minute)
 
 		var database_working = true
 		db, err := sql.Open("mysql", db_dsn)
@@ -228,6 +228,10 @@ func main() {
 				}
 			}
 
+		}
+		if !started {
+			p.RunLoop()
+			started = true
 		}
 		fmt.Println("Starting....")
 
