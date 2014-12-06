@@ -18,11 +18,12 @@ SELECT ip,
        dt AS dtEnd
 FROM ( SELECT ip,
               dtStart
-	   FROM alarms
+       FROM alarms
        WHERE dtEnd IS NULL
-	 ) a
+       AND hold = 0
+     ) a
 LEFT JOIN (SELECT host,
-				  dt
+                  dt
            FROM pingdata
            ORDER BY dt ASC
           ) b
@@ -39,19 +40,24 @@ GROUP BY a.ip
 func create_alarms(db *sql.DB) error {
 	query := `
 REPLACE INTO alarms (ip, dtStart) 
-SELECT ip,
+SELECT host_list.ip,
        start_times.dt AS dtStart
 FROM (
-	   SELECT ip
+       SELECT ip
        FROM hosts
-	   WHERE primary_alias = 1
-	 ) host_list
+       WHERE primary_alias = 1
+     ) host_list
 LEFT JOIN (
             SELECT a.host, dt FROM (SELECT host, dt FROM pingdata ORDER BY dt DESC) a GROUP BY a.host
           ) start_times
 ON host_list.ip = start_times.host
-WHERE start_times.dt < NOW() - INTERVAL 2 MINUTE
-OR start_times.dt IS NULL
+LEFT JOIN (
+            SELECT a.ip, a.hold FROM (SELECT ip, hold FROM alarms ORDER BY dtStart DESC) a GROUP BY a.ip
+          ) existing_alarms
+ON host_list.ip = existing_alarms.ip
+WHERE (start_times.dt < NOW() - INTERVAL 2 MINUTE
+    OR start_times.dt IS NULL)
+AND existing_alarms.hold != b'1'
 `
 	fmt.Println(query)
 	_, err := db.Exec(query)
