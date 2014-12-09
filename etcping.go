@@ -92,23 +92,12 @@ func (e dataEntry) String() string {
 		fmt.Sprintf("%v", float64(e.duration)/float64(time.Millisecond)) + ")"
 }
 
-func updateHostDefinition(db *sql.DB, host_ip string, host_definition host) error {
-	query := `REPLACE INTO hosts (ip, alias, primary_alias, dt) VALUES `
-	query += "('" + host_ip + "','" + host_definition.primary + "', 1, NOW())"
-	for _, v := range host_definition.aliases {
-		query += ",('" + host_ip + "','" + v + "', 0, NOW())"
-	}
-	fmt.Println(query)
-	_, err := db.Exec(query)
-	return err
-}
-
 func batchInsertData(db *sql.DB, storage []dataEntry) ([]dataEntry, error) {
 	if len(storage) == 0 {
 		return storage, nil
 	}
-
-	query := `REPLACE INTO pingdata (dt, host, duration) VALUES `
+	fmt.Println("Inserting", len(storage), "records.")
+	query := `INSERT INTO pingdata (dt, host, duration) VALUES `
 	for k, v := range storage {
 		if k != 0 {
 			query += ","
@@ -116,12 +105,54 @@ func batchInsertData(db *sql.DB, storage []dataEntry) ([]dataEntry, error) {
 
 		query += v.String()
 	}
-	fmt.Println(query)
 	_, err := db.Exec(query)
 	if err != nil {
 		return storage, err
 	}
 	return nil, nil
+}
+
+func update_hosts_table(db *sql.DB, hosts hostList) {
+	query := `CREATE TABLE hosts_new LIKE hosts`
+	_, err := db.Exec(query)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	start := true
+	query = `REPLACE INTO hosts_new (ip, alias, primary_alias, dt) VALUES `
+	for ip, host_data := range hosts {
+		if !start {
+			query += `,`
+		} else {
+			start = false
+		}
+		query += `('` + ip + `','` + host_data.primary + `',1,NOW())`
+		for _, alias := range host_data.aliases {
+			query += `,('` + ip + `','` + alias + `',0,NOW())`
+		}
+	}
+	_, err = db.Exec(query)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	query = `RENAME TABLE hosts TO hosts_old, hosts_new TO hosts`
+	_, err = db.Exec(query)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	query = `DROP TABLE hosts_old`
+	_, err = db.Exec(query)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	return
 }
 
 func main() {
@@ -148,18 +179,12 @@ func main() {
 	p.MaxRTT = time.Second * 60
 	p.OnRecv = func(addr *net.IPAddr, t time.Duration) {
 		record := dataEntry{time.Now(), addr.String(), t}
-		fmt.Println("record:", record)
 		data_dump <- record
 	}
 	p.OnIdle = func() {
 		fmt.Println("idle")
 	}
 
-	/*<-p.Done()
-	if err := p.Err(); err != nil {
-		fmt.Println(err)
-		return
-	}*/
 	var started bool = false
 	var data_storage []dataEntry
 	var batch_insert_ticker = time.Tick(5 * time.Second)
@@ -194,41 +219,20 @@ func main() {
 			fmt.Println(err)
 		}
 
+		go update_hosts_table(db, hosts_update)
+
 		for host_ip, host_definition := range hosts_update {
-			old_host_definition, exists := hosts[host_ip]
+			_, exists := hosts[host_ip]
 			if !exists {
-				fmt.Println(host_ip, host_definition)
 				hosts[host_ip] = host_definition
 				err = p.AddIP(host_ip)
 				if err != nil {
 					fmt.Println(err)
 					return
 				}
-				if database_working {
-					err = updateHostDefinition(db, host_ip, host_definition)
-					if err != nil {
-						fmt.Println(err)
-					}
-				}
-			} else {
-				known_aliases := append(old_host_definition.aliases, old_host_definition.primary)
-				for _, alias := range host_definition.aliases {
-					if !stringInSlice(alias, known_aliases) {
-						tmp := hosts[host_ip]
-						tmp.aliases = append(hosts[host_ip].aliases, alias)
-						hosts[host_ip] = tmp
-
-						if database_working {
-							err = updateHostDefinition(db, host_ip, host_definition)
-							if err != nil {
-								fmt.Println(err)
-							}
-						}
-					}
-				}
 			}
-
 		}
+
 		if !started {
 			p.RunLoop()
 			started = true
@@ -244,6 +248,7 @@ func main() {
 			case <-restart:
 				break SubLoop
 			case record := <-data_dump:
+				//fmt.Println(record)
 				save_start := len(data_storage) - max_storage
 				if save_start < 0 {
 					save_start = 0
@@ -254,7 +259,6 @@ func main() {
 					data_storage, err = batchInsertData(db, data_storage)
 					if err != nil {
 						fmt.Println(err)
-						return
 					}
 				}
 			}

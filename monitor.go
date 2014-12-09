@@ -57,7 +57,7 @@ LEFT JOIN (
 ON host_list.ip = existing_alarms.ip
 WHERE (start_times.dt < NOW() - INTERVAL 2 MINUTE
     OR start_times.dt IS NULL)
-AND existing_alarms.hold != b'1'
+AND (existing_alarms.hold != b'1' OR existing_alarms.hold IS NULL)
 `
 	fmt.Println(query)
 	_, err := db.Exec(query)
