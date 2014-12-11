@@ -84,8 +84,9 @@ type dataEntry struct {
 	duration time.Duration
 }
 
+const dtlayout = "2006-01-02 15:04:05"
+
 func (e dataEntry) String() string {
-	const dtlayout = "2006-01-02 15:04:05"
 	return "('" +
 		e.dt.Format(dtlayout) +
 		"','" + e.host + "'," +
@@ -113,15 +114,19 @@ func batchInsertData(db *sql.DB, storage []dataEntry) ([]dataEntry, error) {
 }
 
 func update_hosts_table(db *sql.DB, hosts hostList) {
-	query := `CREATE TABLE hosts_new LIKE hosts`
-	_, err := db.Exec(query)
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS hosts_new LIKE hosts`)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	_, err = db.Exec(`TRUNCATE hosts_new`)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
 	start := true
-	query = `REPLACE INTO hosts_new (ip, alias, primary_alias, dt) VALUES `
+	query := `REPLACE INTO hosts_new (ip, alias, primary_alias, dt) VALUES `
 	for ip, host_data := range hosts {
 		if !start {
 			query += `,`
@@ -139,20 +144,24 @@ func update_hosts_table(db *sql.DB, hosts hostList) {
 		return
 	}
 
-	query = `RENAME TABLE hosts TO hosts_old, hosts_new TO hosts`
-	_, err = db.Exec(query)
+	_, err = db.Exec(`RENAME TABLE hosts TO hosts_old, hosts_new TO hosts`)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	query = `DROP TABLE hosts_old`
-	_, err = db.Exec(query)
+	_, err = db.Exec(`DROP TABLE hosts_old`)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	return
+}
+
+type host_info struct {
+	LastReply         time.Time
+	LastReplyDuration time.Duration
+	Alarm             bool
 }
 
 func main() {
@@ -162,7 +171,7 @@ func main() {
 		return
 	}
 
-	var max_storage int = 5000
+	var max_storage int = 5000000
 	max_storage_str := os.Getenv("ETCPING_MAX_STORAGE")
 	if len(max_storage_str) != 0 {
 		a, err := strconv.ParseInt(max_storage_str, 10, 32)
@@ -173,10 +182,10 @@ func main() {
 		}
 	}
 
-	var data_dump = make(chan dataEntry, 100)
+	var data_dump = make(chan dataEntry, 10000)
 	p := fastping.NewPinger()
 	p.Debug = false
-	p.MaxRTT = time.Second * 60
+	p.MaxRTT = time.Second * 30
 	p.OnRecv = func(addr *net.IPAddr, t time.Duration) {
 		record := dataEntry{time.Now(), addr.String(), t}
 		data_dump <- record
@@ -187,9 +196,11 @@ func main() {
 
 	var started bool = false
 	var data_storage []dataEntry
+	var clear_storage = make(map[string]time.Time)
 	var batch_insert_ticker = time.Tick(5 * time.Second)
+	var process_alarms_ticker = time.Tick(30 * time.Second)
 
-	var hosts = make(hostList)
+	var hosts = make(map[string]host_info)
 
 	signal_source := make(chan os.Signal)
 	signal.Notify(signal_source, syscall.SIGHUP)
@@ -218,13 +229,13 @@ func main() {
 		if err != nil {
 			fmt.Println(err)
 		}
-
-		go update_hosts_table(db, hosts_update)
-
-		for host_ip, host_definition := range hosts_update {
+		if database_working {
+			go update_hosts_table(db, hosts_update)
+		}
+		for host_ip, _ := range hosts_update {
 			_, exists := hosts[host_ip]
 			if !exists {
-				hosts[host_ip] = host_definition
+				hosts[host_ip] = host_info{}
 				err = p.AddIP(host_ip)
 				if err != nil {
 					fmt.Println(err)
@@ -249,11 +260,41 @@ func main() {
 				break SubLoop
 			case record := <-data_dump:
 				//fmt.Println(record)
+				if record.dt.After(hosts[record.host].LastReply) {
+					tmp := hosts[record.host]
+
+					if tmp.Alarm {
+						clear_storage[record.host] = record.dt
+						tmp.Alarm = false
+					}
+					tmp.LastReply = record.dt
+					tmp.LastReplyDuration = record.duration
+
+					hosts[record.host] = tmp
+				}
 				save_start := len(data_storage) - max_storage
 				if save_start < 0 {
 					save_start = 0
 				}
 				data_storage = append(data_storage[save_start:], record)
+			case current_time := <-process_alarms_ticker:
+				if database_working {
+					var current_alarms = make(map[string]time.Time)
+					for ip, info := range hosts {
+						if info.LastReply.Before(current_time.Add(-1 * time.Minute)) {
+							tmp := hosts[ip]
+							tmp.Alarm = true
+							hosts[ip] = tmp
+							current_alarms[ip] = info.LastReply
+						}
+					}
+					var current_clears = make(map[string]time.Time)
+					for k, v := range clear_storage {
+						current_clears[k] = v
+						delete(clear_storage, k)
+					}
+					store_alarm_state(db, current_alarms, current_clears)
+				}
 			case <-batch_insert_ticker:
 				if database_working {
 					data_storage, err = batchInsertData(db, data_storage)
@@ -267,4 +308,100 @@ func main() {
 		//p.Stop()
 		db.Close()
 	}
+}
+func create_new_alarms(db *sql.DB, current_alarms map[string]time.Time) error {
+	var create_tmp_table = `
+CREATE TEMPORARY TABLE IF NOT EXISTS alarms_update
+LIKE alarms`
+	_, err := db.Exec(create_tmp_table)
+	if err != nil {
+		return err
+	}
+
+	var truncate_tmp_table = `
+TRUNCATE alarms_update`
+	_, err = db.Exec(truncate_tmp_table)
+	if err != nil {
+		return err
+	}
+
+	var create_alarms = `
+INSERT IGNORE INTO alarms_update (ip, dtStart) VALUES
+`
+	var start = true
+	for k, v := range current_alarms {
+		if !start {
+			create_alarms += ","
+		} else {
+			start = false
+		}
+		create_alarms += "('" + k + "','" + v.Format(dtlayout) + "')"
+	}
+	_, err = db.Exec(create_alarms)
+	if err != nil {
+		return err
+	}
+
+	var apply_new_alarms = `
+INSERT INTO alarms (ip, dtStart)
+SELECT alarms_update.ip,
+       alarms_update.dtStart
+FROM alarms_update
+LEFT JOIN alarms
+ON alarms_update.ip = alarms.ip
+AND alarms.dtEnd IS NULL
+WHERE alarms.dtStart IS NULL
+ON DUPLICATE KEY UPDATE dtEnd = NULL
+`
+	_, err = db.Exec(apply_new_alarms)
+	if err != nil {
+		return err
+	}
+	var drop_tmp = `
+DROP TABLE alarms_update`
+	_, err = db.Exec(drop_tmp)
+	return err
+}
+
+func store_alarm_state(db *sql.DB, current_alarms map[string]time.Time, current_clears map[string]time.Time) {
+	var err error
+	fmt.Println("creating new alarms", len(current_alarms), time.Now())
+	if len(current_alarms) > 0 {
+		err = create_new_alarms(db, current_alarms)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
+	fmt.Println("closing alarms precise", len(current_clears), time.Now())
+	var current_clear_query = `
+UPDATE alarms SET dtEnd = ? WHERE ip = ? AND alarms.hold != 1`
+	for k, v := range current_clears {
+		_, err = db.Exec(current_clear_query, v.Format(dtlayout), k)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
+	fmt.Println("closing alarms general", time.Now())
+	var clear_others_query = `
+UPDATE alarms SET dtEnd = NOW()
+WHERE dtEnd IS NULL
+AND hold != b'1'`
+	if len(current_alarms) > 0 {
+		clear_others_query += `AND ip NOT IN (`
+		var start = true
+		for k, _ := range current_alarms {
+			if !start {
+				clear_others_query += ","
+			} else {
+				start = false
+			}
+			clear_others_query += "'" + k + "'"
+		}
+		clear_others_query += ")"
+	}
+	_, err = db.Exec(clear_others_query)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println("store alarm state done", time.Now())
 }
